@@ -1,14 +1,36 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-fn tmp_path(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("ssh_auth_{tag}_{nanos}"))
+/// Create a private, unique directory for files handed to `ssh-keygen`.
+///
+/// A timestamp-only path in `/tmp` is predictable and lets another local user
+/// pre-create a symlink or file at that path.  `create_dir` is atomic, and the
+/// random suffix makes collisions impractical.
+fn temp_dir(tag: &str) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|e| anyhow::anyhow!("system entropy source unavailable: {e}"))?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = std::env::temp_dir().join(format!("ssh_auth_{tag}_{suffix}"));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to create {}", path.display()));
+            }
+        }
+    }
+    bail!("failed to create a unique temporary directory")
 }
 
 fn run_ssh_keygen(args: &[&str]) -> Result<String> {
@@ -79,34 +101,32 @@ pub fn validate_pubkey(pubkey: &str) -> Result<String> {
     if line.contains("-cert-v01@") {
         bail!("that looks like a certificate, not a raw public key");
     }
-    let p = tmp_path("pub");
-    std::fs::write(&p, line.as_bytes())?;
+    let dir = temp_dir("pub")?;
+    let p = dir.join("key.pub");
+    fs::write(&p, line.as_bytes())?;
     let res = (|| -> Result<String> {
         let out = run_ssh_keygen(&["-l", "-f", &p.to_string_lossy()])?;
-        let fp = out
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("")
-            .to_string();
+        let fp = out.split_whitespace().nth(1).unwrap_or("").to_string();
         if fp.is_empty() {
             bail!("could not parse key fingerprint");
         }
         Ok(fp)
     })();
-    let _ = std::fs::remove_file(&p);
+    let _ = fs::remove_dir_all(&dir);
     res
 }
 
 pub fn cert_valid_note(cert: &str) -> Option<String> {
-    let p = tmp_path("certinfo");
-    std::fs::write(&p, cert.trim().as_bytes()).ok()?;
+    let dir = temp_dir("certinfo").ok()?;
+    let p = dir.join("cert.pub");
+    fs::write(&p, cert.trim().as_bytes()).ok()?;
     let res = (|| -> Option<String> {
         let out = run_ssh_keygen(&["-L", "-f", &p.to_string_lossy()]).ok()?;
         out.lines()
             .find(|l| l.trim_start().starts_with("Valid:"))
             .map(|l| l.trim().to_string())
     })();
-    let _ = std::fs::remove_file(&p);
+    let _ = fs::remove_dir_all(&dir);
     res
 }
 
@@ -121,8 +141,9 @@ pub fn sign_cert(
     if ps.is_empty() {
         bail!("cert_principals in config.toml must not be empty");
     }
-    let pub_path = tmp_path(&format!("sign_{}", key_id.replace('/', "_")));
-    std::fs::write(&pub_path, pubkey.trim().as_bytes())?;
+    let dir = temp_dir("sign")?;
+    let pub_path = dir.join("key.pub");
+    fs::write(&pub_path, pubkey.trim().as_bytes())?;
     let cert_path = PathBuf::from(format!("{}-cert.pub", pub_path.display()));
     let mut args: Vec<String> = vec![
         "-s".into(),
@@ -141,10 +162,10 @@ pub fn sign_cert(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let res = (|| -> Result<String> {
         run_ssh_keygen(&arg_refs)?;
-        let cert = std::fs::read_to_string(&cert_path).context("failed to read generated certificate")?;
+        let cert =
+            std::fs::read_to_string(&cert_path).context("failed to read generated certificate")?;
         Ok(cert.trim().to_string())
     })();
-    let _ = std::fs::remove_file(&pub_path);
-    let _ = std::fs::remove_file(&cert_path);
+    let _ = fs::remove_dir_all(&dir);
     res
 }

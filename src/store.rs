@@ -125,9 +125,9 @@ fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<Option<T>> {
         return Ok(None);
     }
     let s = fs::read_to_string(p).with_context(|| format!("failed to read {}", p.display()))?;
-    Ok(Some(
-        serde_json::from_str(&s).with_context(|| format!("failed to parse {}", p.display()))?,
-    ))
+    Ok(Some(serde_json::from_str(&s).with_context(|| {
+        format!("failed to parse {}", p.display())
+    })?))
 }
 
 fn write_json<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
@@ -154,9 +154,8 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<Vec<T>> {
         .filter(|line| !line.trim().is_empty())
         .enumerate()
         .map(|(n, line)| {
-            serde_json::from_str(line).with_context(|| {
-                format!("failed to parse {} line {}", p.display(), n + 1)
-            })
+            serde_json::from_str(line)
+                .with_context(|| format!("failed to parse {} line {}", p.display(), n + 1))
         })
         .collect()
 }

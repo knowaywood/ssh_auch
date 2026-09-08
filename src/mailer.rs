@@ -1,9 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use lettre::{
-    message::Mailbox,
-    message::MultiPart,
+    Message, SmtpTransport, Transport, message::Mailbox, message::MultiPart,
     transport::smtp::authentication::Credentials,
-    Message, SmtpTransport, Transport,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -43,11 +41,7 @@ pub async fn send(
                 .map_err(|e| anyhow::anyhow!("email task failed: {e}"))?
         }
         _ => Ok(Outcome::DryRun(dry_run(
-            email_cfg,
-            outbox_dir,
-            subject,
-            plain,
-            html,
+            email_cfg, outbox_dir, subject, plain, html,
         )?)),
     }
 }
@@ -63,9 +57,15 @@ async fn send_resend(cfg: &EmailConfig, subject: &str, plain: &str, html: &str) 
         bail!("config.toml [email] api_key is not set (get one at resend.com)");
     }
     if cfg.sender.is_empty() {
-        bail!("config.toml [email] sender is not set (use onboarding@resend.dev for the free tier)");
+        bail!(
+            "config.toml [email] sender is not set (use onboarding@resend.dev for the free tier)"
+        );
     }
-    let base = if cfg.api_base.is_empty() { RESEND_BASE } else { cfg.api_base.as_str() };
+    let base = if cfg.api_base.is_empty() {
+        RESEND_BASE
+    } else {
+        cfg.api_base.as_str()
+    };
     let resp = http_client()?
         .post(format!("{base}/emails"))
         .bearer_auth(&cfg.api_key)
@@ -93,7 +93,11 @@ async fn send_brevo(cfg: &EmailConfig, subject: &str, plain: &str, html: &str) -
     if cfg.sender.is_empty() {
         bail!("config.toml [email] sender is not set (verify the sender address in Brevo first)");
     }
-    let base = if cfg.api_base.is_empty() { BREVO_BASE } else { cfg.api_base.as_str() };
+    let base = if cfg.api_base.is_empty() {
+        BREVO_BASE
+    } else {
+        cfg.api_base.as_str()
+    };
     let resp = http_client()?
         .post(format!("{base}/v3/smtp/email"))
         .header("api-key", &cfg.api_key)
@@ -124,11 +128,7 @@ fn send_smtp(
 ) -> Result<Outcome> {
     if !email_cfg.smtp.enabled {
         return Ok(Outcome::DryRun(dry_run(
-            email_cfg,
-            outbox_dir,
-            subject,
-            plain,
-            html,
+            email_cfg, outbox_dir, subject, plain, html,
         )?));
     }
 
@@ -178,7 +178,11 @@ fn dry_run(
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(outbox_dir)?;
     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let name = format!("{}_{}.txt", ts, chrono::Utc::now().timestamp_subsec_millis());
+    let name = format!(
+        "{}_{}.txt",
+        ts,
+        chrono::Utc::now().timestamp_subsec_millis()
+    );
     let path = outbox_dir.join(name);
     let content = format!(
         "To: {}\r\nSubject: {}\r\n\r\n----- text/plain -----\r\n{}\r\n----- text/html -----\r\n{}\r\n",

@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&cfg.data_dir)?;
     std::fs::create_dir_all(cfg.data_dir.join("outbox"))?;
+    std::fs::create_dir_all(cfg.data_dir.join("keys"))?;
     restrict_dir(&cfg.data_dir)?;
     restrict_dir(&cfg.data_dir.join("outbox"))?;
     restrict_dir(&cfg.data_dir.join("keys"))?;
@@ -40,20 +41,20 @@ async fn main() -> Result<()> {
         .listen
         .parse()
         .with_context(|| format!("invalid listen address {}", cfg.listen))?;
-    println!("status page: {}/admin (log in with the [viewer] account from config.toml)", cfg.base());
+    println!(
+        "status page: {}/admin (log in with the [viewer] account from config.toml)",
+        cfg.base()
+    );
     if cfg.tls.enabled {
-        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            &cfg.tls.cert,
-            &cfg.tls.key,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to load TLS certificate/key ({}, {})",
-                cfg.tls.cert.display(),
-                cfg.tls.key.display()
-            )
-        })?;
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cfg.tls.cert, &cfg.tls.key)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load TLS certificate/key ({}, {})",
+                    cfg.tls.cert.display(),
+                    cfg.tls.key.display()
+                )
+            })?;
         println!("ssh_auth listening on https://{}", cfg.listen);
         axum_server::bind_rustls(addr, tls)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
@@ -96,11 +97,16 @@ fn sync_viewer(cfg: &Config, path: &std::path::Path) -> Result<Option<store::Vie
     let stored = store::load_viewer(path)?;
     let need_write = match &stored {
         None => {
-            println!("viewer account \"{username}\" created in {}", path.display());
+            println!(
+                "viewer account \"{username}\" created in {}",
+                path.display()
+            );
             true
         }
         Some(acc) => {
-            if acc.username != username || !auth::verify_password(&cfg.viewer.password, &acc.pass_hash) {
+            if acc.username != username
+                || !auth::verify_password(&cfg.viewer.password, &acc.pass_hash)
+            {
                 println!(
                     "viewer account changed in config.toml — synced to {}",
                     path.display()

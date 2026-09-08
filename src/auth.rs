@@ -1,7 +1,7 @@
 use anyhow::Result;
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -47,8 +47,10 @@ pub fn generate_token() -> String {
 
 pub fn hash_password(password: &str) -> Result<String> {
     let mut salt_bytes = [0u8; 16];
-    getrandom::fill(&mut salt_bytes).map_err(|e| anyhow::anyhow!("system entropy source unavailable: {e}"))?;
-    let salt = SaltString::encode_b64(&salt_bytes[..]).map_err(|e| anyhow::anyhow!("failed to generate salt: {e}"))?;
+    getrandom::fill(&mut salt_bytes)
+        .map_err(|e| anyhow::anyhow!("system entropy source unavailable: {e}"))?;
+    let salt = SaltString::encode_b64(&salt_bytes[..])
+        .map_err(|e| anyhow::anyhow!("failed to generate salt: {e}"))?;
     let phc = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("failed to hash password: {e}"))?;
@@ -95,10 +97,7 @@ impl Sessions {
     }
 
     pub fn remove_user(&self, username: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .retain(|_, (u, _)| u != username);
+        self.inner.lock().unwrap().retain(|_, (u, _)| u != username);
     }
 }
 

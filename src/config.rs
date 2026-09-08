@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use crate::store::EmailConfig;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 

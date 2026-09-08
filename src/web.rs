@@ -3,11 +3,11 @@ use crate::config::Config;
 use crate::mailer;
 use crate::sshca;
 use crate::store::{self, Application, PortEntry, User, ViewerAccount};
+use axum::Router;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -100,8 +100,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/approve/{id}", get(approve_page).post(approve_action))
         .route("/reject/{id}", get(reject_page).post(reject_action))
         .route("/admin", get(admin_page))
-        .route("/admin/login", get(viewer_login_page).post(viewer_login_action))
+        .route(
+            "/admin/login",
+            get(viewer_login_page).post(viewer_login_action),
+        )
         .route("/admin/logout", get(viewer_logout).post(viewer_logout))
+        .route("/admin/gateway-setup.sh", get(api_gateway_setup))
         .route("/api/principals", get(api_principals))
         .route("/api/setup.sh", get(api_setup_sh))
         .route("/api/setup.ps1", get(api_setup_ps1))
@@ -130,7 +134,6 @@ form{background:#fff;border:1px solid #dfe1e5;padding:16px;margin:12px 0}
 form.inline{display:inline;border:0;padding:0;margin:0}
 label{display:block;margin:10px 0 4px;font-size:.9rem;color:#444}
 input,select,textarea{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font:inherit}
-form.inline input{display:none}
 textarea{font-family:ui-monospace,monospace}
 button{margin-top:14px;padding:8px 22px;border:0;border-radius:4px;background:#1a73e8;color:#fff;font:inherit;cursor:pointer}
 form.inline button{margin-top:0}
@@ -157,7 +160,10 @@ fn err_page(msg: &str) -> Response {
     layout(
         StatusCode::BAD_REQUEST,
         "Error",
-        format!("<p class=\"bad\">{}</p><p><a href=\"/\">Back to home</a></p>", esc(msg)),
+        format!(
+            "<p class=\"bad\">{}</p><p><a href=\"/\">Back to home</a></p>",
+            esc(msg)
+        ),
     )
 }
 
@@ -165,7 +171,10 @@ fn internal_page(msg: &str) -> Response {
     layout(
         StatusCode::INTERNAL_SERVER_ERROR,
         "Internal Server Error",
-        format!("<p class=\"bad\">{}</p><p><a href=\"/\">Back to home</a></p>", esc(msg)),
+        format!(
+            "<p class=\"bad\">{}</p><p><a href=\"/\">Back to home</a></p>",
+            esc(msg)
+        ),
     )
 }
 
@@ -174,11 +183,47 @@ fn now_rfc3339() -> String {
 }
 
 fn host_of(base: &str) -> String {
-    let s = base.trim().trim_end_matches('/');
-    let s = s.split("://").nth(1).unwrap_or(s);
-    let s = s.split('/').next().unwrap_or(s);
-    let s = s.split(':').next().unwrap_or(s);
-    s.trim_start_matches('[').trim_end_matches(']').to_string()
+    reqwest::Url::parse(base)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned()
+            })
+        })
+        .unwrap_or_else(|| base.trim().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_of, parse_frps_ports};
+    use serde_json::json;
+
+    #[test]
+    fn host_of_handles_ports_and_ipv6() {
+        assert_eq!(
+            host_of("https://ssh.example.com:8443/path"),
+            "ssh.example.com"
+        );
+        assert_eq!(host_of("https://[2001:db8::1]:8443"), "2001:db8::1");
+    }
+
+    #[test]
+    fn frps_v071_port_parser_reads_remote_port_from_conf() {
+        let ports = parse_frps_ports(&json!({
+            "proxies": [
+                {"name": "ssh-a", "conf": {"remotePort": 6001}},
+                {"name": "ssh-b", "conf": {"remotePort": 6002}},
+                {"name": "offline", "status": "offline"},
+                {"name": "invalid", "conf": {"remotePort": 70000}}
+            ]
+        }));
+        assert_eq!(
+            ports.iter().map(|port| port.port).collect::<Vec<_>>(),
+            [6001, 6002]
+        );
+    }
 }
 
 fn user_status_html(status: &str) -> &'static str {
@@ -222,11 +267,11 @@ fn viewer_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
     state.viewer_sessions.get(&sid)
 }
 
-fn require_viewer(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+fn require_viewer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     if viewer_session(state, headers).is_some() {
         Ok(())
     } else {
-        Err(Redirect::to("/admin/login").into_response())
+        Err(Box::new(Redirect::to("/admin/login").into_response()))
     }
 }
 
@@ -245,12 +290,24 @@ fn cookie_redirect(loc: &str, name: &str, sid: &str, secure: bool) -> Response {
     resp
 }
 
-fn clear_cookie_page(status: StatusCode, title: &str, body: String, name: &str, secure: bool) -> Response {
+fn clear_cookie_page(
+    status: StatusCode,
+    title: &str,
+    body: String,
+    name: &str,
+    secure: bool,
+) -> Response {
     let mut resp = layout(status, title, body);
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_bytes(format!("{name}=; HttpOnly{}; SameSite=Lax; Path=/; Max-Age=0", if secure { "; Secure" } else { "" }).as_bytes())
-            .unwrap(),
+        HeaderValue::from_bytes(
+            format!(
+                "{name}=; HttpOnly{}; SameSite=Lax; Path=/; Max-Age=0",
+                if secure { "; Secure" } else { "" }
+            )
+            .as_bytes(),
+        )
+        .unwrap(),
     );
     resp
 }
@@ -258,10 +315,10 @@ fn clear_cookie_page(status: StatusCode, title: &str, body: String, name: &str, 
 fn rate_limited(map: &Mutex<HashMap<IpAddr, Instant>>, ip: IpAddr) -> bool {
     let mut g = map.lock().unwrap();
     g.retain(|_, t| t.elapsed() < Duration::from_secs(3600));
-    if let Some(t) = g.get(&ip) {
-        if t.elapsed() < Duration::from_secs(60) {
-            return true;
-        }
+    if let Some(t) = g.get(&ip)
+        && t.elapsed() < Duration::from_secs(60)
+    {
+        return true;
     }
     g.insert(ip, Instant::now());
     false
@@ -284,10 +341,10 @@ async fn get_ports(state: &AppState) -> Result<Vec<PortEntry>, String> {
     if state.cfg.ports_source == "frps" {
         {
             let cache = state.ports_cache.lock().unwrap();
-            if let Some((t, v)) = &*cache {
-                if t.elapsed() < Duration::from_secs(60) {
-                    return Ok(v.clone());
-                }
+            if let Some((t, v)) = &*cache
+                && t.elapsed() < Duration::from_secs(60)
+            {
+                return Ok(v.clone());
             }
         }
         let v = fetch_frps(&state.cfg)
@@ -311,13 +368,17 @@ async fn fetch_frps(cfg: &Config) -> anyhow::Result<Vec<PortEntry>> {
         req = req.basic_auth(&cfg.frps.username, Some(&cfg.frps.password));
     }
     let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+    Ok(parse_frps_ports(&v))
+}
+
+fn parse_frps_ports(v: &serde_json::Value) -> Vec<PortEntry> {
     let mut ports = Vec::new();
     if let Some(arr) = v["proxies"].as_array() {
         for p in arr {
-            if p["type"].as_str() != Some("tcp") {
-                continue;
-            }
-            let Some(pn) = p["remote_port"].as_u64() else {
+            // frp v0.71.0's legacy dashboard endpoint returns each TCP
+            // proxy as `{ name, conf: { remotePort }, ... }`. Offline
+            // proxies have no `conf`, so they are intentionally omitted.
+            let Some(pn) = p["conf"]["remotePort"].as_u64() else {
                 continue;
             };
             if pn == 0 || pn > 65535 {
@@ -333,7 +394,7 @@ async fn fetch_frps(cfg: &Config) -> anyhow::Result<Vec<PortEntry>> {
     }
     ports.sort_by_key(|e| e.port);
     ports.dedup_by_key(|e| e.port);
-    Ok(ports)
+    ports
 }
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -342,8 +403,9 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
     }
     let ports_block = match get_ports(&state).await {
         Ok(ports) => {
-            let mut table =
-                String::from("<table><tr><th>Public port</th><th>Internal server</th><th>Notes</th></tr>");
+            let mut table = String::from(
+                "<table><tr><th>Public port</th><th>Internal server</th><th>Notes</th></tr>",
+            );
             for p in &ports {
                 table.push_str(&format!(
                     "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
@@ -417,7 +479,9 @@ async fn register_action(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return auth_form_error("Username must be 3-32 chars, only letters/digits/underscore/hyphen");
+        return auth_form_error(
+            "Username must be 3-32 chars, only letters/digits/underscore/hyphen",
+        );
     }
     if f.password.len() < 8 || f.password.len() > 64 {
         return auth_form_error("Password must be 8-64 characters");
@@ -442,7 +506,12 @@ async fn register_action(
         return internal_page(&format!("failed to save user: {e:#}"));
     }
     let sid = state.sessions.create(&username);
-    cookie_redirect("/dashboard", "sid", &sid, state.cfg.base_url.starts_with("https://"))
+    cookie_redirect(
+        "/dashboard",
+        "sid",
+        &sid,
+        state.cfg.base_url.starts_with("https://"),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -494,13 +563,15 @@ async fn login_action(State(state): State<Arc<AppState>>, Form(f): Form<LoginFor
     }
     state.login_guard.reset(&username);
     let sid = state.sessions.create(&username);
-    cookie_redirect("/dashboard", "sid", &sid, state.cfg.base_url.starts_with("https://"))
+    cookie_redirect(
+        "/dashboard",
+        "sid",
+        &sid,
+        state.cfg.base_url.starts_with("https://"),
+    )
 }
 
-async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(sid) = cookie_val(&headers, "sid") {
         state.sessions.remove(&sid);
     }
@@ -577,8 +648,7 @@ async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
         "active" => {
             let cert = user.cert.clone().unwrap_or_default();
             let fp = user.fingerprint.clone().unwrap_or_default();
-            let valid =
-                sshca::cert_valid_note(&cert).unwrap_or_else(|| state.validity_display());
+            let valid = sshca::cert_valid_note(&cert).unwrap_or_else(|| state.validity_display());
             let token_disp = user
                 .token
                 .clone()
@@ -590,7 +660,7 @@ async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
 <form method=\"post\" action=\"/regen-token\"><button class=\"warn\">Regenerate token</button></form>",
                 esc(&token_disp)
             ));
-            let base = esc(&state.cfg.base());
+            let base = esc(state.cfg.base());
             let token_esc = esc(&token_disp);
             body.push_str(&format!(
                 "<h2>One-command setup</h2>\
@@ -724,8 +794,7 @@ async fn apply(
 
     let email_cfg = state.cfg.email.clone();
     let (subject, plain, html) = app_email(&state, &app);
-    let mail_result =
-        mailer::send(&email_cfg, &state.outbox_dir(), &subject, &plain, &html).await;
+    let mail_result = mailer::send(&email_cfg, &state.outbox_dir(), &subject, &plain, &html).await;
 
     let mail_note = match mail_result {
         Ok(mailer::Outcome::Sent(via)) => {
@@ -797,7 +866,7 @@ async fn revoke_self(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         if u.status != "active" {
             return err_page("No active token to revoke");
         }
-        u.status = "none".into();
+        u.status = "revoked".into();
         u.cert = None;
         u.decided_at = Some(now_rfc3339());
     }
@@ -846,8 +915,24 @@ async fn delete_account(
         let mut users = state.users.lock().unwrap();
         users.retain(|u| u.username != username);
     }
+    {
+        // Invalidate approval links for the deleted account.  Without this,
+        // recreating the same username could let an old pending application
+        // approve a certificate for the new account.
+        let mut apps = state.apps.lock().unwrap();
+        for app in apps
+            .iter_mut()
+            .filter(|app| app.username == username && app.is_pending())
+        {
+            app.status = "withdrawn".into();
+            app.decided_at = Some(now_rfc3339());
+        }
+    }
     if let Err(e) = store::save_users(&state.users_path(), &state.users.lock().unwrap()) {
         return internal_page(&format!("failed to save user: {e:#}"));
+    }
+    if let Err(e) = store::save_applications(&state.apps_path(), &state.apps.lock().unwrap()) {
+        return internal_page(&format!("failed to save applications: {e:#}"));
     }
     let kp = state.key_path(&username);
     let _ = std::fs::remove_file(&kp);
@@ -862,9 +947,9 @@ async fn delete_account(
     )
 }
 
-fn require_active(state: &AppState, headers: &HeaderMap) -> Result<(String, User), Response> {
+fn require_active(state: &AppState, headers: &HeaderMap) -> Result<(String, User), Box<Response>> {
     let Some(username) = session_user(state, headers) else {
-        return Err(Redirect::to("/login").into_response());
+        return Err(Box::new(Redirect::to("/login").into_response()));
     };
     let user = {
         state
@@ -876,10 +961,14 @@ fn require_active(state: &AppState, headers: &HeaderMap) -> Result<(String, User
             .cloned()
     };
     let Some(user) = user else {
-        return Err(err_page("Account not found (it may have been deleted)"));
+        return Err(Box::new(err_page(
+            "Account not found (it may have been deleted)",
+        )));
     };
     if user.status != "active" {
-        return Err(err_page("Token is not active, download unavailable"));
+        return Err(Box::new(err_page(
+            "Token is not active, download unavailable",
+        )));
     }
     Ok((username, user))
 }
@@ -887,7 +976,7 @@ fn require_active(state: &AppState, headers: &HeaderMap) -> Result<(String, User
 async fn my_key(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (username, _) = match require_active(&state, &headers) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let path = state.key_path(&username);
     let content = match std::fs::read_to_string(&path) {
@@ -900,7 +989,7 @@ async fn my_key(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 async fn my_pub(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (username, _) = match require_active(&state, &headers) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let path = state.key_path(&username).with_extension("pub");
     let content = match std::fs::read_to_string(&path) {
@@ -913,7 +1002,7 @@ async fn my_pub(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 async fn my_cert(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (_, user) = match require_active(&state, &headers) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let Some(cert) = &user.cert else {
         return err_page("Certificate not found");
@@ -925,7 +1014,7 @@ fn find_app_and_check(
     state: &AppState,
     id: &str,
     token: &str,
-) -> Result<Application, Response> {
+) -> Result<Application, Box<Response>> {
     let app = {
         state
             .apps
@@ -936,14 +1025,14 @@ fn find_app_and_check(
             .cloned()
     };
     let Some(app) = app else {
-        return Err(err_page("Application not found"));
+        return Err(Box::new(err_page("Application not found")));
     };
     if app.approve_token != token {
-        return Err(layout(
+        return Err(Box::new(layout(
             StatusCode::FORBIDDEN,
             "No Access",
             "<p class=\"bad\">Incorrect link token</p>".into(),
-        ));
+        )));
     }
     Ok(app)
 }
@@ -965,7 +1054,7 @@ async fn approve_page(
     let token = q.get("token").map(|s| s.as_str()).unwrap_or("");
     let app = match find_app_and_check(&state, &id, token) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !app.is_pending() {
         return ok_page(
@@ -999,15 +1088,10 @@ async fn approve_page(
     ok_page("Approval Confirmation", body)
 }
 
-async fn decide(
-    state: &Arc<AppState>,
-    id: &str,
-    token: &str,
-    approve: bool,
-) -> Response {
+async fn decide(state: &Arc<AppState>, id: &str, token: &str, approve: bool) -> Response {
     let app = match find_app_and_check(state, id, token) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !app.is_pending() {
         return ok_page(
@@ -1074,11 +1158,12 @@ async fn decide(
         }
         {
             let mut users = state.users.lock().unwrap();
-            if let Some(u) = users.iter_mut().find(|u| u.username == app.username) {
-                if u.status == "pending" {
-                    u.status = "none".into();
-                    u.decided_at = Some(now_rfc3339());
-                }
+            if let Some(u) = users.iter_mut().find(|u| u.username == app.username)
+                && u.status == "pending"
+            {
+                u.status = "none".into();
+                u.fingerprint = None;
+                u.decided_at = Some(now_rfc3339());
             }
         }
         if let Err(e) = store::save_users(&state.users_path(), &state.users.lock().unwrap()) {
@@ -1111,7 +1196,7 @@ async fn reject_page(
     let token = q.get("token").map(|s| s.as_str()).unwrap_or("");
     let app = match find_app_and_check(&state, &id, token) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !app.is_pending() {
         return ok_page(
@@ -1213,7 +1298,10 @@ async fn viewer_login_page(State(state): State<Arc<AppState>>, headers: HeaderMa
     ok_page("Information Account Login", body)
 }
 
-async fn viewer_login_action(State(state): State<Arc<AppState>>, Form(f): Form<LoginForm>) -> Response {
+async fn viewer_login_action(
+    State(state): State<Arc<AppState>>,
+    Form(f): Form<LoginForm>,
+) -> Response {
     let username = f.username.trim().to_string();
     if state.viewer_guard.locked(&username) {
         return err_page("Too many failed attempts, try again in 5 minutes");
@@ -1236,7 +1324,12 @@ async fn viewer_login_action(State(state): State<Arc<AppState>>, Form(f): Form<L
     }
     state.viewer_guard.reset(&username);
     let sid = state.viewer_sessions.create(&acc.username);
-    cookie_redirect("/admin", "vsid", &sid, state.cfg.base_url.starts_with("https://"))
+    cookie_redirect(
+        "/admin",
+        "vsid",
+        &sid,
+        state.cfg.base_url.starts_with("https://"),
+    )
 }
 
 async fn viewer_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1252,12 +1345,9 @@ async fn viewer_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -
     )
 }
 
-async fn admin_page(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn admin_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(r) = require_viewer(&state, &headers) {
-        return r;
+        return *r;
     }
 
     let mut app_rows = String::new();
@@ -1319,7 +1409,11 @@ async fn admin_page(
             } else {
                 &email_cfg.sender
             }),
-            if email_cfg.api_key.is_empty() { "not set" } else { "configured" }
+            if email_cfg.api_key.is_empty() {
+                "not set"
+            } else {
+                "configured"
+            }
         )
     };
 
@@ -1361,12 +1455,10 @@ async fn admin_page(
 <table><tr><th>Username</th><th>Status</th><th>Fingerprint</th><th>Registered</th><th>Last decision</th><th>Actions</th></tr>{user_rows}</table>\
 <p class=\"note\">Revocation takes effect immediately (machines verify in real time); revoked users may apply again. Delete also removes their key files.</p>\
 <h2>Recipient email</h2>\
-<p class=\"note\">Current recipient: <b>{}</b> (stored in data/email.json). Mail provider: {mail_desc}</p>\
-<form method=\"post\" action=\"/admin/email\">\
-<label>New recipient email</label><input name=\"recipient\" value=\"{}\" required>\
-<button>Save</button></form>\
+<p class=\"note\">Current recipient: <b>{}</b> (from config.toml [email]). Mail provider: {mail_desc}</p>\
 <h2>Gateway setup (public server only — internal machines need nothing)</h2>\
-<p class=\"note\">1. frps: add <code>proxyBindAddr = \"127.0.0.1\"</code> to frps.toml and restart, so tunnel ports are loopback-only (if your frp version lacks this option, block the tunnel ports with a firewall instead). 2. Create the gateway account: <code>useradd -m -s /usr/sbin/nologin {} &amp;&amp; usermod -p '*' {}</code>. 3. Save the CA public key below to <code>/etc/ssh/trusted-user-ca.pub</code>. 4. Save the script as <code>/usr/local/bin/ssh_auth_principals.sh</code> and <code>chmod +x</code>. 5. Save the sshd config as <code>/etc/ssh/sshd_config_gateway</code>. 6. Install the systemd unit and start it. Re-generate PermitOpen when the port list changes.</p>\
+<p><a href=\"/admin/gateway-setup.sh\">Download one-click gateway installer</a> — run it on this public server with <code>sudo sh ssh_auth-gateway-setup.sh</code>.</p>\
+<p class=\"note\">The installer handles the gateway account, CA, authorization callback, dedicated sshd configuration, and systemd service. You only need to keep frps tunnel ports loopback-only by setting <code>proxyBindAddr = \"127.0.0.1\"</code> in frps.toml and restarting frps (or use a firewall if your frp version lacks this option).</p>\
 <pre>{}</pre>\
 <pre>{script}</pre>\
 <pre>{sshd_conf}</pre>\
@@ -1376,134 +1468,70 @@ async fn admin_page(
 <p class=\"note\">Config: principals={} , validity={} , ports_source={} , gateway_port={} , gateway_user={}</p>\
 <p><a href=\"/admin/logout\">Sign out of admin console</a></p>",
         esc(&email_cfg.recipient),
-        esc(&email_cfg.recipient),
-        esc(&state.cfg.gateway_user),
-        esc(&state.cfg.gateway_user),
         esc(&state.ca_pub),
         esc(&state.cfg.cert_principals.join(",")),
-        esc(&state.cfg.cert_validity.trim()),
+        esc(state.cfg.cert_validity.trim()),
         esc(&state.cfg.ports_source),
         state.cfg.gateway_port,
         esc(&state.cfg.gateway_user),
     );
     let body = body
         .replace(
-            "<form method=\"post\" action=\"/admin/email\">",
-            "<div style=\"display:none\">",
+            "Sign out of admin console",
+            "Sign out of information account",
         )
-        .replace("(stored in data/email.json)", "(from config.toml [email])")
-        .replace("Sign out of admin console", "Sign out of information account")
         .replace("Admin Console", "Information Status");
     ok_page("Information Status", body)
 }
 
-#[cfg(any())]
-#[derive(serde::Deserialize)]
-struct AdminEmailForm {
-    recipient: String,
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-#[cfg(any())]
-async fn admin_email(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Form(f): Form<AdminEmailForm>,
-) -> Response {
+async fn api_gateway_setup(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(r) = require_viewer(&state, &headers) {
-        return r;
+        return *r;
     }
-    let recipient = f.recipient.trim().to_string();
-    if recipient.parse::<lettre::message::Mailbox>().is_err() {
-        return err_page("Email address format is invalid");
-    }
-    let mut cfg = match store::load_email(&state.email_path()) {
-        Ok(c) => c,
-        Err(e) => return internal_page(&format!("failed to read email.json: {e:#}")),
-    };
-    cfg.recipient = recipient.clone();
-    if let Err(e) = store::save_email(&state.email_path(), &cfg) {
-        return internal_page(&format!("failed to save email.json: {e:#}"));
-    }
-    ok_page(
-        "Saved",
-        format!(
-            "<p class=\"ok\">Recipient email updated to {}</p><p><a href=\"/admin\">Back to console</a></p>",
-            esc(&recipient)
+    let (permit_open, ports_note) = match get_ports(&state).await {
+        Ok(ports) if !ports.is_empty() => (
+            ports
+                .iter()
+                .map(|p| format!("127.0.0.1:{}", p.port))
+                .collect::<Vec<_>>()
+                .join(" "),
+            String::new(),
         ),
+        Ok(_) => ("127.0.0.1:*".into(), "port list is empty".into()),
+        Err(e) => ("127.0.0.1:*".into(), format!("failed to fetch ports: {e}")),
+    };
+    let callback = format!(
+        "#!/bin/sh\nBASE={}\ncurl -fsS -m 3 \"$BASE/api/principals?key_id=$1\" || exit 1\n",
+        shell_quote(state.cfg.base())
+    );
+    let sshd_conf = format!(
+        "Port {}\nListenAddress 0.0.0.0\nPidFile /run/sshd-auth-gateway.pid\nTrustedUserCAKeys /etc/ssh/trusted-user-ca.pub\nAuthorizedPrincipalsCommand /usr/local/bin/ssh_auth_principals.sh %i\nAuthorizedPrincipalsCommandUser nobody\nPubkeyAuthentication yes\nPasswordAuthentication no\nChallengeResponseAuthentication no\nAllowTcpForwarding local\nAllowAgentForwarding no\nX11Forwarding no\nPermitTTY no\nPermitOpen {}\nAllowUsers {}\n",
+        state.cfg.gateway_port, permit_open, state.cfg.gateway_user
+    );
+    let unit = "[Unit]\nDescription=ssh_auth gateway (sshd)\nAfter=network.target\n\n[Service]\nExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_gateway\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n";
+    let script = format!(
+        "#!/bin/sh\nset -eu\n[ \"$(id -u)\" -eq 0 ] || {{ echo 'run this script with sudo'; exit 1; }}\n\nGATEWAY_USER={user}\nif ! id \"$GATEWAY_USER\" >/dev/null 2>&1; then\n  useradd -m -s /usr/sbin/nologin \"$GATEWAY_USER\"\nfi\nusermod -s /usr/sbin/nologin -p '*' \"$GATEWAY_USER\"\n\ninstall -m 0644 /dev/stdin /etc/ssh/trusted-user-ca.pub <<'SSH_AUTH_CA'\n{ca}SSH_AUTH_CA\ninstall -m 0755 /dev/stdin /usr/local/bin/ssh_auth_principals.sh <<'SSH_AUTH_CALLBACK'\n{callback}SSH_AUTH_CALLBACK\ninstall -m 0644 /dev/stdin /etc/ssh/sshd_config_gateway <<'SSH_AUTH_CONFIG'\n{sshd}SSH_AUTH_CONFIG\ninstall -m 0644 /dev/stdin /etc/systemd/system/sshd-auth-gateway.service <<'SSH_AUTH_UNIT'\n{unit}SSH_AUTH_UNIT\n\n/usr/sbin/sshd -t -f /etc/ssh/sshd_config_gateway\nsystemctl daemon-reload\nsystemctl enable --now sshd-auth-gateway\necho 'ssh_auth gateway is ready ({ports_note})'\n",
+        user = shell_quote(&state.cfg.gateway_user),
+        ca = state.ca_pub,
+        callback = callback,
+        sshd = sshd_conf,
+        unit = unit,
+        ports_note = ports_note,
+    );
+    let mut response = (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
     )
-}
-
-#[cfg(any())]
-#[derive(serde::Deserialize)]
-struct AdminUserForm {
-    username: String,
-    action: String,
-}
-
-#[cfg(any())]
-async fn admin_user_action(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Form(f): Form<AdminUserForm>,
-) -> Response {
-    if let Err(r) = require_viewer(&state, &headers) {
-        return r;
-    }
-    let username = f.username.trim().to_string();
-    match f.action.as_str() {
-        "delete" => {
-            {
-                let mut users = state.users.lock().unwrap();
-                users.retain(|u| u.username != username);
-            }
-            if let Err(e) = store::save_users(&state.users_path(), &state.users.lock().unwrap()) {
-                return internal_page(&format!("failed to save user: {e:#}"));
-            }
-            let kp = state.key_path(&username);
-            let _ = std::fs::remove_file(&kp);
-            let _ = std::fs::remove_file(kp.with_extension("pub"));
-            state.sessions.remove_user(&username);
-            ok_page(
-                "Done",
-                format!(
-                    "<p class=\"ok\">User {} deleted (key files and sessions cleared; past applications kept).</p><p><a href=\"/admin\">Back to console</a></p>",
-                    esc(&username)
-                ),
-            )
-        }
-        "revoke" => {
-            let done = {
-                let mut users = state.users.lock().unwrap();
-                let Some(u) = users.iter_mut().find(|u| u.username == username) else {
-                    return err_page("User not found");
-                };
-                if u.status == "active" {
-                    u.status = "revoked".into();
-                    u.cert = None;
-                    u.decided_at = Some(now_rfc3339());
-                    true
-                } else {
-                    false
-                }
-            };
-            if let Err(e) = store::save_users(&state.users_path(), &state.users.lock().unwrap()) {
-                return internal_page(&format!("failed to save user: {e:#}"));
-            }
-            let msg = if done {
-                "Revoked: the user's access is cut off in real time (they may apply again)."
-            } else {
-                "Action not applicable to this user's current status; nothing changed."
-            };
-            ok_page(
-                "Done",
-                format!(
-                    "<p class=\"ok\">{}</p><p><a href=\"/admin\">Back to console</a></p>",
-                    msg
-                ),
-            )
-        }
-        _ => err_page("Unknown action"),
-    }
+        .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=ssh_auth-gateway-setup.sh"),
+    );
+    response
 }
 
 async fn api_principals(
@@ -1619,7 +1647,7 @@ async fn api_setup_sh(
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        build_setup_sh(&state.cfg.base(), t),
+        build_setup_sh(state.cfg.base(), t),
     )
         .into_response()
 }
@@ -1640,7 +1668,7 @@ async fn api_setup_ps1(
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        build_setup_ps1(&state.cfg.base(), t),
+        build_setup_ps1(state.cfg.base(), t),
     )
         .into_response()
 }

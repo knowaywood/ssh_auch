@@ -64,17 +64,18 @@ cross-compilation target and release asset.
 ```toml
 listen = "0.0.0.0:8443"       # direct HTTPS; use 127.0.0.1:8080 behind an HTTPS reverse proxy
 base_url = "https://ssh.example.com"   # used in emails + setup commands; HTTPS recommended
+ports_source = "frps"          # live from frps dashboard API
+ports_file = "data/ports.json"
+gateway_port = 2222
+gateway_user = "tunnel"
 [tls]
 enabled = true
 cert = "tls/fullchain.pem"
 key = "tls/privkey.pem"
-ports_source = "frps"          # live from frps dashboard API
 [frps]
 api = "http://127.0.0.1:7500"
 username = "admin"
 password = "..."
-gateway_port = 2222
-gateway_user = "tunnel"
 [viewer]
 username = "viewer"
 password = "a-strong-password"   # source of truth; synced to data/viewer.json on restart
@@ -100,16 +101,20 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-systemctl daemon-reload && systemctl enable --now ssh-auth
+sudo systemctl daemon-reload && sudo systemctl enable --now ssh-auth
 ```
 
-Before enabling the service, create the dedicated user and grant it ownership of
-the deployment directory:
+The relative paths in `config.toml` (such as `data/` and `tls/`) are resolved
+from `WorkingDirectory=/opt/ssh_auth`. If you change `WorkingDirectory` or run
+the binary manually, either start it from the directory containing the config
+and data tree or change those paths to absolute paths.
 
-```bash
-sudo useradd --system --home /opt/ssh_auth --shell /usr/sbin/nologin ssh-auth
-sudo chown -R ssh-auth:ssh-auth /opt/ssh_auth
-```
+Create the service account manually, or use an existing dedicated non-root
+account. Its name must match `User=` and `Group=` in the unit above. Grant it
+write access to `data/`, `data/keys/`, and `data/outbox/`, and read access to
+`config.toml` plus the configured TLS certificate/private key. Keep the binary
+owned by `root:root`; do not recursively `chown` the whole deployment directory.
+The service can run as root, but that is not recommended.
 
 Check logs with:
 
@@ -125,21 +130,22 @@ proxyBindAddr = "127.0.0.1"
 
 (if your frp version lacks this option, block the tunnel ports externally with a firewall instead)
 
-**5. Gateway account**
+**5. Gateway setup — one command**
+
+Open `https://ssh.example.com/admin`, sign in with the `[viewer]` account, and
+click **Download one-click gateway installer**. Copy the downloaded file to the
+public server and run:
 
 ```bash
-useradd -m -s /usr/sbin/nologin tunnel
-usermod -p '*' tunnel        # unlock account without enabling password login
+sudo sh ssh_auth-gateway-setup.sh
 ```
 
-**6. Gateway sshd (dedicated instance)** — copy from the `/admin` page:
+The generated installer creates the `tunnel` account, installs the CA,
+real-time authorization callback, dedicated `sshd` configuration, and systemd
+unit. It runs `sshd -t` before enabling the service and includes the current
+`PermitOpen` port list. Download it again whenever the frps port list changes.
 
-- CA public key → `/etc/ssh/trusted-user-ca.pub`
-- verification script → `/usr/local/bin/ssh_auth_principals.sh` + `chmod +x`
-- sshd config → `/etc/ssh/sshd_config_gateway` (Port 2222, `TrustedUserCAKeys`, `AuthorizedPrincipalsCommand ... %i`, `AllowTcpForwarding local`, `PermitOpen 127.0.0.1:<port>...`, `AllowUsers tunnel`, no TTY/agent/X11 forwarding)
-- systemd unit → `/etc/systemd/system/sshd-auth-gateway.service`, then `systemctl enable --now sshd-auth-gateway`
-
-**7. Finish up**
+**6. Finish up**
 
 - Visit `/admin` and log in with the `[viewer]` account from config.toml to verify
 - Edit the `[email]` section in `config.toml` (provider `resend`/`brevo`/`smtp`) so approval emails actually send
@@ -189,6 +195,7 @@ Configure the `[email]` section in `config.toml`:
 | `POST /regen-token` | Regenerate the access token (requires login) |
 | `GET/POST /approve/{id}` `/reject/{id}?token=` | Admin email approval links (the only way to approve/reject) |
 | `GET /admin` | Read-only information page + gateway setup guide (viewer session required) |
+| `GET /admin/gateway-setup.sh` | Download the generated one-click gateway installer (viewer session required) |
 | `GET/POST /admin/login` `/admin/logout` | Information account log in (account from config.toml `[viewer]`) / log out |
 | `GET /my/key` `/my/pub` `/my/cert` | Manual downloads (login + active) |
 | `GET /api/setup.sh` `/api/setup.ps1` `?t=` | One-command setup scripts (token auth) |
