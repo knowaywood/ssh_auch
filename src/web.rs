@@ -197,7 +197,7 @@ fn host_of(base: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_of, parse_frps_ports};
+    use super::{build_setup_ps1, build_setup_sh, host_of, parse_frps_ports};
     use serde_json::json;
 
     #[test]
@@ -223,6 +223,18 @@ mod tests {
             ports.iter().map(|port| port.port).collect::<Vec<_>>(),
             [6001, 6002]
         );
+    }
+
+    #[test]
+    fn setup_scripts_keep_lf_line_endings() {
+        for script in [
+            build_setup_sh("https://example.test", "sk_auth_test"),
+            build_setup_ps1("https://example.test", "sk_auth_test"),
+        ] {
+            assert!(!script.contains('\r'));
+            assert!(script.ends_with('\n'));
+            assert!(script.lines().count() > 5);
+        }
     }
 }
 
@@ -1514,7 +1526,7 @@ async fn api_gateway_setup(State(state): State<Arc<AppState>>, headers: HeaderMa
     );
     let unit = "[Unit]\nDescription=ssh_auth gateway (sshd)\nAfter=network.target\n\n[Service]\nExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_gateway\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n";
     let script = format!(
-        "#!/bin/sh\nset -eu\n[ \"$(id -u)\" -eq 0 ] || {{ echo 'run this script with sudo'; exit 1; }}\n\nGATEWAY_USER={user}\nif ! id \"$GATEWAY_USER\" >/dev/null 2>&1; then\n  useradd -m -s /usr/sbin/nologin \"$GATEWAY_USER\"\nfi\nusermod -s /usr/sbin/nologin -p '*' \"$GATEWAY_USER\"\n\ninstall -m 0644 /dev/stdin /etc/ssh/trusted-user-ca.pub <<'SSH_AUTH_CA'\n{ca}SSH_AUTH_CA\ninstall -m 0755 /dev/stdin /usr/local/bin/ssh_auth_principals.sh <<'SSH_AUTH_CALLBACK'\n{callback}SSH_AUTH_CALLBACK\ninstall -m 0644 /dev/stdin /etc/ssh/sshd_config_gateway <<'SSH_AUTH_CONFIG'\n{sshd}SSH_AUTH_CONFIG\ninstall -m 0644 /dev/stdin /etc/systemd/system/sshd-auth-gateway.service <<'SSH_AUTH_UNIT'\n{unit}SSH_AUTH_UNIT\n\n/usr/sbin/sshd -t -f /etc/ssh/sshd_config_gateway\nsystemctl daemon-reload\nsystemctl enable --now sshd-auth-gateway\necho 'ssh_auth gateway is ready ({ports_note})'\n",
+        "#!/bin/sh\nset -eu\n[ \"$(id -u)\" -eq 0 ] || {{ echo 'run this script with sudo'; exit 1; }}\n\nGATEWAY_USER={user}\nif ! id \"$GATEWAY_USER\" >/dev/null 2>&1; then\n  useradd -m -s /usr/sbin/nologin \"$GATEWAY_USER\"\nfi\nusermod -s /usr/sbin/nologin -p '*' \"$GATEWAY_USER\"\n\ninstall -m 0644 /dev/stdin /etc/ssh/trusted-user-ca.pub <<'SSH_AUTH_CA'\n{ca}\nSSH_AUTH_CA\ninstall -m 0755 /dev/stdin /usr/local/bin/ssh_auth_principals.sh <<'SSH_AUTH_CALLBACK'\n{callback}SSH_AUTH_CALLBACK\ninstall -m 0644 /dev/stdin /etc/ssh/sshd_config_gateway <<'SSH_AUTH_CONFIG'\n{sshd}SSH_AUTH_CONFIG\ninstall -m 0644 /dev/stdin /etc/systemd/system/sshd-auth-gateway.service <<'SSH_AUTH_UNIT'\n{unit}SSH_AUTH_UNIT\n\n/usr/sbin/sshd -t -f /etc/ssh/sshd_config_gateway\nsystemctl daemon-reload\nsystemctl enable --now sshd-auth-gateway\necho 'ssh_auth gateway is ready ({ports_note})'\n",
         user = shell_quote(&state.cfg.gateway_user),
         ca = state.ca_pub,
         callback = callback,
@@ -1522,6 +1534,7 @@ async fn api_gateway_setup(State(state): State<Arc<AppState>>, headers: HeaderMa
         unit = unit,
         ports_note = ports_note,
     );
+    let script = normalize_script(script);
     let mut response = (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
         script,
@@ -1587,8 +1600,17 @@ fn api_not_found() -> Response {
         .into_response()
 }
 
+fn normalize_script(script: String) -> String {
+    let script = script.replace("\r\n", "\n").replace('\r', "\n");
+    if script.ends_with('\n') {
+        script
+    } else {
+        format!("{script}\n")
+    }
+}
+
 fn build_setup_sh(base: &str, token: &str) -> String {
-    format!(
+    normalize_script(format!(
         r#"#!/bin/sh
 set -e
 BASE="{base}"
@@ -1605,11 +1627,11 @@ curl -fsSL "$BASE/api/file/config?t=$T" >> "$SSH_DIR/config.tmp"
 mv "$SSH_DIR/config.tmp" "$SSH_DIR/config"
 echo "ssh_auth: files installed to $SSH_DIR and config updated. Connect with 'ssh frp-<port>' or VSCode Remote-SSH."
 "#
-    )
+    ))
 }
 
 fn build_setup_ps1(base: &str, token: &str) -> String {
-    format!(
+    normalize_script(format!(
         r#"$ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $sshDir = Join-Path $env:USERPROFILE ".ssh"
@@ -1628,7 +1650,7 @@ $kept = @($old | Where-Object {{
 Set-Content -Path $cfg -Value ($kept + ($block -split "`r?`n"))
 Write-Host "ssh_auth: files installed to $sshDir and config updated. Connect with 'ssh frp-<port>' or VSCode Remote-SSH."
 "#
-    )
+    ))
 }
 
 async fn api_setup_sh(

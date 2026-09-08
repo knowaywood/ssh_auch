@@ -144,7 +144,9 @@ pub fn sign_cert(
     let dir = temp_dir("sign")?;
     let pub_path = dir.join("key.pub");
     fs::write(&pub_path, pubkey.trim().as_bytes())?;
-    let cert_path = PathBuf::from(format!("{}-cert.pub", pub_path.display()));
+    // ssh-keygen replaces the `.pub` suffix, so `key.pub` produces
+    // `key-cert.pub` (not `key.pub-cert.pub`).
+    let cert_path = pub_path.with_file_name("key-cert.pub");
     let mut args: Vec<String> = vec![
         "-s".into(),
         ca_key.to_string_lossy().to_string(),
@@ -168,4 +170,26 @@ pub fn sign_cert(
     })();
     let _ = fs::remove_dir_all(&dir);
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_ca, generate_keypair, sign_cert, temp_dir};
+    use std::fs;
+
+    #[test]
+    fn sign_cert_reads_ssh_keygen_output() {
+        let dir = temp_dir("test").expect("create test directory");
+        let ca = dir.join("ca");
+        let user_key = dir.join("user");
+        ensure_ca(&ca, "test-ca").expect("create CA");
+        generate_keypair(&user_key, "test-user").expect("create user key");
+        let pubkey = fs::read_to_string(user_key.with_extension("pub")).expect("read public key");
+
+        let cert = sign_cert(&ca, &pubkey, "test-user", &["ssh-auth".into()], "")
+            .expect("sign certificate");
+        assert!(cert.starts_with("ssh-ed25519-cert-v01@openssh.com "));
+
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
 }
