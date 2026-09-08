@@ -1,0 +1,76 @@
+listen = "0.0.0.0:8443"
+# Used to build the approve/reject links in emails and the verification callback.
+# Change to your public domain or IP after deployment (HTTPS recommended).
+base_url = "https://ssh.example.com"
+
+data_dir = "data"
+
+# Port list source: "frps" queries the frps dashboard API (live); "file" reads ports_file as fallback
+# Bind frps webServer to 127.0.0.1 with a strong password and it is safe to expose the tunnels
+ports_source = "frps"
+ports_file = "data/ports.json"
+
+# SSH issuing CA private key, auto-generated on first start; its public key is shown on /admin
+# and must be installed on every internal machine: /etc/ssh/trusted-user-ca.pub
+ca_key = "data/ca_ed25519"
+
+# Certificate principals (authorization identity) — NOT the login username!
+# Internal machine sshd setup (once per machine, full instructions on /admin):
+#   TrustedUserCAKeys /etc/ssh/trusted-user-ca.pub
+#   AuthorizedPrincipalsCommand <verification script> %i
+#   AuthorizedPrincipalsCommandUser nobody
+# Users register, log in, and request a token; the admin approves via email, the
+# server generates the keypair and issues the certificate. Users connect through
+# the public gateway (certificate, password-free); revocation is enforced in real
+# time through the /api/principals callback. Internal machines need no special
+# sshd setup — they keep normal username + password login.
+cert_principals = ["ssh-auth"]
+# Certificate validity: empty = valid forever (default); or pass to ssh-keygen -V,
+# e.g. "+720h" (30 days), "+52w" (one year)
+cert_validity = ""
+
+# Public gateway sshd (dedicated instance) port and account, used for ProxyJump.
+# Full deployment steps are shown on the /admin page. Users authenticate to the
+# gateway with their certificate, then jump to internal machines where they log
+# in with the machine's normal username + password.
+gateway_port = 2222
+gateway_user = "tunnel"
+
+# Direct HTTPS (recommended for production). The certificate must include the
+# public hostname in base_url. Set enabled=true and use PEM files.
+[tls]
+enabled = true
+cert = "tls/fullchain.pem"
+key = "tls/privkey.pem"
+
+# ---- Read-only information account for the /admin status page ----
+# config.toml is the single source of truth: on every startup the password is
+# verified against data/viewer.json (where only the argon2 hash is stored) and
+# re-synced automatically if it (or the username) changed. Changing the password
+# takes effect after a restart. An empty password disables viewer login.
+# Approval itself is email-only (one-time links); the status page is read-only.
+[viewer]
+username = "viewer"
+password = "set-a-strong-password"
+
+# ---- frps dashboard API (for the live port list) ----
+[frps]
+api = "http://127.0.0.1:7500"
+username = "admin"
+password = "admin"
+
+# ---- Email sending (config.toml) ----
+# provider: "dryrun" only writes a local outbox file (default) | "resend" | "brevo" | "smtp"
+# resend: register at resend.com (free 100/day), create an API key and put the re_ key
+#   into api_key; without a verified domain set sender to "onboarding@resend.dev"
+#   and you can only email the address you registered with
+# brevo: register at brevo.com (free 300/day), verify the sender address in the console,
+#   then fill api_key (starts with xkeysib-)
+# smtp: classic SMTP (QQ/163/Gmail app passwords), fill the smtp section and enabled=true
+# api_base is for testing only, leave empty for the official endpoints
+[email]
+provider = "dryrun"
+recipient = "admin@example.com"
+sender = ""
+api_key = ""
+api_base = ""
