@@ -16,11 +16,20 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build
-        run: cargo build --release
+      # Build inside a manylinux image so the binary only requires glibc 2.28.
+      # Alibaba Cloud Linux 3 currently provides glibc 2.32; the default
+      # ubuntu-22.04 runner links against glibc 2.35 and is not compatible.
+      - name: Build in a glibc-compatible environment
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/io" \
+            -w /io \
+            quay.io/pypa/manylinux_2_28_x86_64 \
+            bash -lc '
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              source /root/.cargo/env
+              cargo build --release
+            '
 
       - name: Package
         run: |
