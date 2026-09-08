@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use crate::config::Config;
@@ -130,19 +129,21 @@ fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<Option<T>> {
     })?))
 }
 
-fn write_json<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = p.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut f, v)?;
-        f.flush()?;
-    }
-    fs::rename(&tmp, p)?;
-    restrict_file(p)?;
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, contents)?;
+    restrict_file(&temp)?;
+    fs::rename(&temp, path)?;
+    restrict_file(path)?;
     Ok(())
+}
+
+fn write_json<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
+    let mut contents = serde_json::to_vec_pretty(v)?;
+    contents.push(b'\n');
+    atomic_write(p, &contents)
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<Vec<T>> {
@@ -161,21 +162,12 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<Vec<T>> {
 }
 
 fn write_jsonl<T: Serialize>(p: &Path, values: &[T]) -> Result<()> {
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent)?;
+    let mut contents = Vec::new();
+    for value in values {
+        serde_json::to_writer(&mut contents, value)?;
+        contents.push(b'\n');
     }
-    let tmp = p.with_extension("jsonl.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        for value in values {
-            serde_json::to_writer(&mut f, value)?;
-            f.write_all(b"\n")?;
-        }
-        f.flush()?;
-    }
-    fs::rename(&tmp, p)?;
-    restrict_file(p)?;
-    Ok(())
+    atomic_write(p, &contents)
 }
 
 #[cfg(unix)]

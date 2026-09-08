@@ -160,13 +160,23 @@ Register (no approval) → Log in → "Apply for Token" (zero input)
     → admin clicks "Approve" in the email → certificate issued + token generated
     → dashboard shows the token + one-command setup
     → paste the command in a terminal → files land in ~/.ssh/, config appended
-    → VSCode Remote-SSH: Connect to Host → pick frp-10001 → in
+    → add the internal machine's Host/port/username to VSCode Remote-SSH → in
 ```
 
 - Linux/macOS: `curl -fsSL '<base>/api/setup.sh?t=sk_auth_...' | sh`
 - Windows PowerShell: `irm '<base>/api/setup.ps1?t=sk_auth_...' | iex`
 
-The setup scripts are idempotent; the config block is wrapped in `# >>> ssh_auth >>> ... # <<< ssh_auth <<<` markers and is refreshed on re-run. First connection asks to confirm two host fingerprints (gateway, internal machine) and prompts for the internal account's password; the gateway hop itself is password-free.
+The setup scripts are idempotent; the config block is wrapped in `# >>> ssh_auth >>> ... # <<< ssh_auth <<<` markers and is refreshed on re-run. It configures only the certificate-authenticated `ssh-auth-gateway` hop. Add each internal target yourself in VS Code's SSH config so its username is never guessed:
+
+```sshconfig
+Host my-server
+  HostName 127.0.0.1
+  Port <FRP_PORT>
+  User <INTERNAL_USERNAME>
+  ProxyJump ssh-auth-gateway
+```
+
+Then use **Remote-SSH: Connect to Host...** and select `my-server`. First connection asks to confirm two host fingerprints (gateway, internal machine) and prompts for the internal account's password; the gateway hop itself is password-free.
 
 ### Email configuration
 

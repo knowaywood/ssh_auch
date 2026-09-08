@@ -6,14 +6,32 @@ use crate::store::{self, Application, PortEntry, User, ViewerAccount};
 use axum::Router;
 use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+mod account;
+mod ports;
+mod session;
+mod ui;
+
+use account::{login_action, login_page, logout, register_action, register_page};
+use ports::get_ports;
+#[cfg(test)]
+use ports::parse_frps_ports;
+use session::{
+    clear_cookie_page, cookie_redirect, cookie_val, rate_limited, require_viewer, session_user,
+    viewer_session,
+};
+use ui::{
+    app_status_html, auth_form_error, err_page, esc, internal_page, layout, ok_page,
+    user_status_html,
+};
 
 pub struct AppState {
     pub cfg: Config,
@@ -116,68 +134,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-const CSS: &str = r#"
-body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f5f6f8;color:#222;margin:0}
-.wrap{max-width:820px;margin:24px auto;padding:0 16px}
-h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid #ddd;padding-bottom:6px}
-table{border-collapse:collapse;width:100%;background:#fff}
-th,td{border:1px solid #dfe1e5;padding:8px 10px;text-align:left;font-size:.92rem;word-break:break-all}
-th{background:#eef0f3}
-form{background:#fff;border:1px solid #dfe1e5;padding:16px;margin:12px 0}
-form.inline{display:inline;border:0;padding:0;margin:0}
-label{display:block;margin:10px 0 4px;font-size:.9rem;color:#444}
-input,select,textarea{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:4px;font:inherit}
-textarea{font-family:ui-monospace,monospace}
-button{margin-top:14px;padding:8px 22px;border:0;border-radius:4px;background:#1a73e8;color:#fff;font:inherit;cursor:pointer}
-form.inline button{margin-top:0}
-button.warn{background:#d93025}
-pre{background:#f0f1f3;border:1px solid #dfe1e5;padding:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-size:.85rem}
-.note{color:#666;font-size:.85rem}
-.ok{color:#137333;font-weight:600} .bad{color:#c5221f;font-weight:600} .pend{color:#b06000;font-weight:600}
-a{color:#1a73e8}
-"#;
-
-fn layout(status: StatusCode, title: &str, body: String) -> Response {
-    let html = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{}</title><style>{CSS}</style></head><body><div class="wrap"><h1>SSH Access Service (frp Tunneling)</h1>{body}</div></body></html>"#,
-        esc(title)
-    );
-    (status, Html(html)).into_response()
-}
-
-fn ok_page(title: &str, body: String) -> Response {
-    layout(StatusCode::OK, title, body)
-}
-
-fn err_page(msg: &str) -> Response {
-    layout(
-        StatusCode::BAD_REQUEST,
-        "Error",
-        format!(
-            "<p class=\"bad\">{}</p><p><a href=\"/\">Back to home</a></p>",
-            esc(msg)
-        ),
-    )
-}
-
-fn internal_page(msg: &str) -> Response {
-    layout(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Internal Server Error",
-        format!(
-            "<p class=\"bad\">{}</p><p><a href=\"/\">Back to home</a></p>",
-            esc(msg)
-        ),
-    )
-}
-
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -197,7 +153,8 @@ fn host_of(base: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_setup_ps1, build_setup_sh, host_of, parse_frps_ports};
+    use super::{build_setup_ps1, build_setup_sh, host_of, parse_frps_ports, ssh_config_block};
+    use crate::config::Config;
     use serde_json::json;
 
     #[test]
@@ -236,104 +193,16 @@ mod tests {
             assert!(script.lines().count() > 5);
         }
     }
-}
 
-fn user_status_html(status: &str) -> &'static str {
-    match status {
-        "active" => "<span class=\"ok\">Active</span>",
-        "pending" => "<span class=\"pend\">Pending review</span>",
-        "revoked" => "<span class=\"bad\">Revoked</span>",
-        _ => "<span class=\"note\">Not applied</span>",
+    #[test]
+    fn generated_config_contains_only_the_gateway() {
+        let config = Config::default();
+        let block = ssh_config_block(&config);
+        assert!(block.contains("Host ssh-auth-gateway"));
+        assert!(block.contains("User tunnel"));
+        assert!(!block.contains("User root"));
+        assert!(!block.contains("Host frp-"));
     }
-}
-
-fn app_status_html(status: &str) -> &'static str {
-    match status {
-        "approved" => "<span class=\"ok\">Approved</span>",
-        "rejected" => "<span class=\"bad\">Rejected</span>",
-        "withdrawn" => "<span class=\"note\">Withdrawn</span>",
-        _ => "<span class=\"pend\">Pending</span>",
-    }
-}
-
-fn cookie_val(headers: &HeaderMap, name: &str) -> Option<String> {
-    for v in headers.get_all(header::COOKIE) {
-        let s = v.to_str().ok()?;
-        for part in s.split(';') {
-            let part = part.trim();
-            if let Some(rest) = part.strip_prefix(&format!("{name}=")) {
-                return Some(rest.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn session_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let sid = cookie_val(headers, "sid")?;
-    state.sessions.get(&sid)
-}
-
-fn viewer_session(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let sid = cookie_val(headers, "vsid")?;
-    state.viewer_sessions.get(&sid)
-}
-
-fn require_viewer(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    if viewer_session(state, headers).is_some() {
-        Ok(())
-    } else {
-        Err(Box::new(Redirect::to("/admin/login").into_response()))
-    }
-}
-
-fn cookie_redirect(loc: &str, name: &str, sid: &str, secure: bool) -> Response {
-    let mut resp = Redirect::to(loc).into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        format!(
-            "{name}={sid}; HttpOnly{}; SameSite=Lax; Path=/; Max-Age={}",
-            if secure { "; Secure" } else { "" },
-            auth::SESSION_TTL.as_secs()
-        )
-        .parse()
-        .unwrap(),
-    );
-    resp
-}
-
-fn clear_cookie_page(
-    status: StatusCode,
-    title: &str,
-    body: String,
-    name: &str,
-    secure: bool,
-) -> Response {
-    let mut resp = layout(status, title, body);
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_bytes(
-            format!(
-                "{name}=; HttpOnly{}; SameSite=Lax; Path=/; Max-Age=0",
-                if secure { "; Secure" } else { "" }
-            )
-            .as_bytes(),
-        )
-        .unwrap(),
-    );
-    resp
-}
-
-fn rate_limited(map: &Mutex<HashMap<IpAddr, Instant>>, ip: IpAddr) -> bool {
-    let mut g = map.lock().unwrap();
-    g.retain(|_, t| t.elapsed() < Duration::from_secs(3600));
-    if let Some(t) = g.get(&ip)
-        && t.elapsed() < Duration::from_secs(60)
-    {
-        return true;
-    }
-    g.insert(ip, Instant::now());
-    false
 }
 
 fn download_response(filename: &str, content: &str) -> Response {
@@ -347,66 +216,6 @@ fn download_response(filename: &str, content: &str) -> Response {
         HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
     );
     (h, content.to_string()).into_response()
-}
-
-async fn get_ports(state: &AppState) -> Result<Vec<PortEntry>, String> {
-    if state.cfg.ports_source == "frps" {
-        {
-            let cache = state.ports_cache.lock().unwrap();
-            if let Some((t, v)) = &*cache
-                && t.elapsed() < Duration::from_secs(60)
-            {
-                return Ok(v.clone());
-            }
-        }
-        let v = fetch_frps(&state.cfg)
-            .await
-            .map_err(|e| format!("failed to fetch port list from frps API: {e:#}"))?;
-        *state.ports_cache.lock().unwrap() = Some((Instant::now(), v.clone()));
-        Ok(v)
-    } else {
-        store::load_ports(&state.cfg.ports_file)
-            .map_err(|e| format!("failed to read ports.json: {e:#}"))
-    }
-}
-
-async fn fetch_frps(cfg: &Config) -> anyhow::Result<Vec<PortEntry>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    let url = format!("{}/api/proxy/tcp", cfg.frps.api.trim_end_matches('/'));
-    let mut req = client.get(&url);
-    if !cfg.frps.username.is_empty() {
-        req = req.basic_auth(&cfg.frps.username, Some(&cfg.frps.password));
-    }
-    let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
-    Ok(parse_frps_ports(&v))
-}
-
-fn parse_frps_ports(v: &serde_json::Value) -> Vec<PortEntry> {
-    let mut ports = Vec::new();
-    if let Some(arr) = v["proxies"].as_array() {
-        for p in arr {
-            // frp v0.71.0's legacy dashboard endpoint returns each TCP
-            // proxy as `{ name, conf: { remotePort }, ... }`. Offline
-            // proxies have no `conf`, so they are intentionally omitted.
-            let Some(pn) = p["conf"]["remotePort"].as_u64() else {
-                continue;
-            };
-            if pn == 0 || pn > 65535 {
-                continue;
-            }
-            let name = p["name"].as_str().unwrap_or("unknown").to_string();
-            ports.push(PortEntry {
-                port: pn as u16,
-                name,
-                desc: "from frps".into(),
-            });
-        }
-    }
-    ports.sort_by_key(|e| e.port);
-    ports.dedup_by_key(|e| e.port);
-    ports
 }
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -445,180 +254,18 @@ async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respon
 }
 
 #[derive(serde::Deserialize)]
-struct RegForm {
-    username: String,
-    password: String,
-    password2: String,
-}
-
-fn auth_form_error(msg: &str) -> Response {
-    layout(
-        StatusCode::BAD_REQUEST,
-        "Error",
-        format!(
-            "<p class=\"bad\">{}</p><p><a href=\"javascript:history.back()\">Go back</a> | <a href=\"/\">Back to home</a></p>",
-            esc(msg)
-        ),
-    )
-}
-
-async fn register_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if session_user(&state, &headers).is_some() {
-        return Redirect::to("/dashboard").into_response();
-    }
-    let body = "\
-<h2>Create an account</h2>\
-<form method=\"post\" action=\"/register\">\
-<label>Username (3-32 chars: letters/digits/_/-)</label><input name=\"username\" required maxlength=\"32\">\
-<label>Password (at least 8 chars)</label><input type=\"password\" name=\"password\" required minlength=\"8\" maxlength=\"64\">\
-<label>Confirm password</label><input type=\"password\" name=\"password2\" required minlength=\"8\" maxlength=\"64\">\
-<button>Register</button></form>\
-<p class=\"note\">Registration needs no approval. Already have an account? <a href=\"/login\">Log in</a></p>";
-    ok_page("Register", body.into())
-}
-
-async fn register_action(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Form(f): Form<RegForm>,
-) -> Response {
-    if rate_limited(&state.last_reg, addr.ip()) {
-        return err_page("Registering too frequently, try again in a minute");
-    }
-    let username = f.username.trim().to_string();
-    if !(3..=32).contains(&username.len())
-        || !username
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return auth_form_error(
-            "Username must be 3-32 chars, only letters/digits/underscore/hyphen",
-        );
-    }
-    if f.password.len() < 8 || f.password.len() > 64 {
-        return auth_form_error("Password must be 8-64 characters");
-    }
-    if f.password != f.password2 {
-        return auth_form_error("Passwords do not match");
-    }
-    {
-        let users = state.users.lock().unwrap();
-        if users.iter().any(|u| u.username == username) {
-            return auth_form_error("Username is already taken");
-        }
-    }
-    let pw = f.password.clone();
-    let hash = match tokio::task::spawn_blocking(move || auth::hash_password(&pw)).await {
-        Ok(Ok(h)) => h,
-        _ => return internal_page("failed to hash password"),
-    };
-    let user = User::new(&username, &hash, now_rfc3339());
-    state.users.lock().unwrap().push(user);
-    if let Err(e) = store::save_users(&state.users_path(), &state.users.lock().unwrap()) {
-        return internal_page(&format!("failed to save user: {e:#}"));
-    }
-    let sid = state.sessions.create(&username);
-    cookie_redirect(
-        "/dashboard",
-        "sid",
-        &sid,
-        state.cfg.base_url.starts_with("https://"),
-    )
-}
-
-#[derive(serde::Deserialize)]
-struct LoginForm {
+pub(super) struct LoginForm {
     username: String,
     password: String,
 }
 
-async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if session_user(&state, &headers).is_some() {
-        return Redirect::to("/dashboard").into_response();
-    }
-    let body = "\
-<h2>Log in</h2>\
-<form method=\"post\" action=\"/login\">\
-<label>Username</label><input name=\"username\" required maxlength=\"32\">\
-<label>Password</label><input type=\"password\" name=\"password\" required maxlength=\"64\">\
-<button>Log in</button></form>\
-<p class=\"note\">No account yet? <a href=\"/register\">Register</a></p>";
-    ok_page("Login", body.into())
-}
-
-async fn login_action(State(state): State<Arc<AppState>>, Form(f): Form<LoginForm>) -> Response {
-    let username = f.username.trim().to_string();
-    if state.login_guard.locked(&username) {
-        return err_page("Too many failed attempts, try again in 5 minutes");
-    }
-    let user = {
-        state
-            .users
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|u| u.username == username)
-            .cloned()
-    };
-    let Some(user) = user else {
-        state.login_guard.fail(&username);
-        return err_page("Incorrect username or password");
-    };
-    let pw = f.password.clone();
-    let phc = user.pass_hash.clone();
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&pw, &phc))
-        .await
-        .unwrap_or(false);
-    if !ok {
-        state.login_guard.fail(&username);
-        return err_page("Incorrect username or password");
-    }
-    state.login_guard.reset(&username);
-    let sid = state.sessions.create(&username);
-    cookie_redirect(
-        "/dashboard",
-        "sid",
-        &sid,
-        state.cfg.base_url.starts_with("https://"),
+fn ssh_config_block(cfg: &Config) -> String {
+    let host = host_of(&cfg.base_url);
+    let gw_port = cfg.gateway_port;
+    let gw_user = &cfg.gateway_user;
+    format!(
+        "# >>> ssh_auth >>>\nHost ssh-auth-gateway\n  HostName {host}\n  Port {gw_port}\n  User {gw_user}\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/id_ed25519\n  CertificateFile ~/.ssh/id_ed25519-cert.pub\n# <<< ssh_auth <<<\n"
     )
-}
-
-async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if let Some(sid) = cookie_val(&headers, "sid") {
-        state.sessions.remove(&sid);
-    }
-    clear_cookie_page(
-        StatusCode::OK,
-        "Signed out",
-        "<p class=\"ok\">You have signed out.</p><p><a href=\"/\">Back to home</a> | <a href=\"/login\">Log in again</a></p>".into(),
-        "sid",
-        state.cfg.base_url.starts_with("https://"),
-    )
-}
-
-async fn ssh_config_block(state: &AppState) -> String {
-    let host = host_of(&state.cfg.base_url);
-    let gw_port = state.cfg.gateway_port;
-    let gw_user = &state.cfg.gateway_user;
-    let mut s = format!(
-        "# >>> ssh_auth >>>\nHost ssh-auth-gateway\n  HostName {host}\n  Port {gw_port}\n  User {gw_user}\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/id_ed25519\n  CertificateFile ~/.ssh/id_ed25519-cert.pub\n"
-    );
-    match get_ports(state).await {
-        Ok(ports) => {
-            for p in &ports {
-                s.push_str(&format!(
-                    "\nHost frp-{}\n  HostName 127.0.0.1\n  Port {}\n  User root\n  IdentitiesOnly yes\n  ProxyJump ssh-auth-gateway\n",
-                    p.port, p.port
-                ));
-            }
-            if ports.is_empty() {
-                s.push_str("\n# no open ports right now\n");
-            }
-        }
-        Err(e) => s.push_str(&format!("\n# failed to fetch port list: {e}\n")),
-    }
-    s.push_str("# <<< ssh_auth <<<\n");
-    s
 }
 
 async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -680,15 +327,17 @@ async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
 <pre>curl -fsSL '{base}/api/setup.sh?t={token_esc}' | sh</pre>\
 <p>Windows (PowerShell):</p>\
 <pre>irm '{base}/api/setup.ps1?t={token_esc}' | iex</pre>\
-<p class=\"note\">The script installs your private key + certificate into <code>~/.ssh/</code> and appends the ssh config block (gateway + every open port). Idempotent — safe to re-run.</p>\
+<p class=\"note\">The script installs your private key + certificate into <code>~/.ssh/</code> and appends only the gateway ssh config block. Idempotent — safe to re-run.</p>\
 <p class=\"note\">Connection model: the gateway hop on the public server is certificate-authenticated and password-free; at the internal machine you log in with that machine's normal username + password.</p>"
             ));
-            let cfg_block = ssh_config_block(&state).await;
+            let cfg_block = ssh_config_block(&state.cfg);
             body.push_str(&format!(
                 "<h2>Use it in VSCode</h2>\
 <ol><li>Install the <b>Remote - SSH</b> extension.</li>\
-<li><code>F1</code> → <b>Remote-SSH: Connect to Host...</b> → pick an alias (e.g. <code>frp-10001</code>).</li>\
-<li>First connect: confirm the gateway host fingerprint, then the internal machine's; enter the internal account's password when asked. The gateway hop itself is password-free (certificate).</li></ol>\
+<li>Open <b>Remote-SSH: Open SSH Configuration File...</b> and add a target entry, replacing <code>&lt;FRP_PORT&gt;</code> and <code>&lt;INTERNAL_USERNAME&gt;</code>:</li></ol>\
+<pre>Host my-server\n  HostName 127.0.0.1\n  Port &lt;FRP_PORT&gt;\n  User &lt;INTERNAL_USERNAME&gt;\n  ProxyJump ssh-auth-gateway</pre>\
+<ol start=\"3\"><li><code>F1</code> → <b>Remote-SSH: Connect to Host...</b> → select <code>my-server</code>.</li>\
+<li>First connect: confirm the gateway host fingerprint, then the internal machine's; enter that internal user's password when asked. The gateway hop itself is password-free (certificate).</li></ol>\
 <p class=\"note\">Certificate: {} · fingerprint <code>{}</code> · approved at {}</p>\
 <details><summary>Advanced: manual download &amp; raw ssh config</summary>\
 <p><a href=\"/my/key\">private key</a> | <a href=\"/my/cert\">certificate</a> — save into <code>~/.ssh/</code>, then <code>chmod 600 ~/.ssh/id_ed25519</code> (Linux/Mac).</p>\
@@ -1625,7 +1274,7 @@ touch "$SSH_DIR/config"
 awk 'BEGIN{{skip=0}} /^# >>> ssh_auth >>>$/{{skip=1;next}} /^# <<< ssh_auth <<<$/{{skip=0;next}} skip==0{{print}}' "$SSH_DIR/config" > "$SSH_DIR/config.tmp"
 curl -fsSL "$BASE/api/file/config?t=$T" >> "$SSH_DIR/config.tmp"
 mv "$SSH_DIR/config.tmp" "$SSH_DIR/config"
-echo "ssh_auth: files installed to $SSH_DIR and config updated. Connect with 'ssh frp-<port>' or VSCode Remote-SSH."
+echo "ssh_auth: gateway certificate config installed. Add your target Host, Port, User, and ProxyJump ssh-auth-gateway in ~/.ssh/config or VSCode Remote-SSH."
 "#
     ))
 }
@@ -1648,7 +1297,7 @@ $kept = @($old | Where-Object {{
     else {{ -not $inBlock }}
 }})
 Set-Content -Path $cfg -Value ($kept + ($block -split "`r?`n"))
-Write-Host "ssh_auth: files installed to $sshDir and config updated. Connect with 'ssh frp-<port>' or VSCode Remote-SSH."
+Write-Host "ssh_auth: gateway certificate config installed. Add your target Host, Port, User, and ProxyJump ssh-auth-gateway in $sshDir\\config or VSCode Remote-SSH."
 "#
     ))
 }
@@ -1737,7 +1386,7 @@ async fn api_file_config(
     let Some(_) = token_user(&state, t) else {
         return api_not_found();
     };
-    let block = ssh_config_block(&state).await;
+    let block = ssh_config_block(&state.cfg);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
