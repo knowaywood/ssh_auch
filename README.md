@@ -55,9 +55,10 @@ To upgrade, stop the service, download the new version, extract it over the old
 binary, and start the service again. Keep the server's `config.toml`, `data/`, and
 `tls/` directory unchanged so users, the CA key, and certificates are preserved.
 
-The release workflow uses `ubuntu-22.04` for compatibility with older Debian/Ubuntu
-servers. It currently produces an `x86_64` Linux binary; ARM servers need a separate
-cross-compilation target and release asset.
+The release workflow builds inside `manylinux_2_28`, so the `x86_64` binary only
+requires glibc 2.28 and works on Alibaba Cloud Linux 3 (glibc 2.32) and other
+compatible older Linux servers. ARM servers need a separate cross-compilation
+target and release asset.
 
 **2. config.toml**
 
